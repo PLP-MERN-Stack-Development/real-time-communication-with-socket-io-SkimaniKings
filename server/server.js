@@ -1,132 +1,104 @@
-// server.js - Main server file for Socket.io chat application
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
 
-// Load environment variables
-dotenv.config();
-
-// Initialize Express app
 const app = express();
+app.use(cors());
+
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
+    origin: "http://localhost:5173", // Typical Vite port
+    methods: ["GET", "POST"]
+  }
 });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+// Store users in memory
+let users = [];
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
-
-// Socket.io connection handler
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
+  socket.on('login', (userData) => {
+    const user = { ...userData, id: socket.id, status: 'online' };
+    users.push(user);
+    io.emit('users_list', users);
+    socket.emit('login_success', user);
   });
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
+  socket.on('join_room', (roomId) => {
+    socket.join(roomId);
+    console.log(`User ${socket.id} joined room ${roomId}`);
   });
 
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
+  socket.on('send_message', (data) => {
+    // data should contain { roomId, text, senderId, ... }
+    // If it's a DM, roomId might be the recipient's socket ID or a unique DM ID
+    if (data.roomId === 'general' || data.roomId === 'tech' || data.roomId === 'random') {
+        io.to(data.roomId).emit('receive_message', data);
+    } else {
+        // Handle DM: emit to sender and recipient
+        // Note: In this simple demo, roomId for DM is the target userId
+        io.to(data.roomId).emit('receive_message', data);
+        socket.emit('receive_message', data); // Echo back to sender
     }
   });
 
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
-    };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
+  socket.on('typing', (data) => {
+    // Broadcast to room except sender
+    if (data.roomId) {
+        socket.to(data.roomId).emit('typing', data);
+    } else {
+        socket.broadcast.emit('typing', data);
+    }
+  });
+  
+  socket.on('stop_typing', (data) => {
+     if (data.roomId) {
+        socket.to(data.roomId).emit('stop_typing', data);
+    } else {
+        socket.broadcast.emit('stop_typing', data);
+    }
   });
 
-  // Handle disconnection
+  // Call Signaling Events
+  socket.on('call_user', (data) => {
+      // data: { toUserId, isVideo }
+      io.to(data.toUserId).emit('call_incoming', {
+          fromUserId: socket.id,
+          fromUserName: users.find(u => u.id === socket.id)?.username || 'Unknown',
+          isVideo: data.isVideo
+      });
+  });
+
+  socket.on('call_accepted', (data) => {
+      // data: { toUserId }
+      io.to(data.toUserId).emit('call_accepted', {
+          remoteUserId: socket.id,
+          remoteUserName: users.find(u => u.id === socket.id)?.username || 'Unknown',
+          remoteUserAvatar: users.find(u => u.id === socket.id)?.avatar
+      });
+  });
+
+  socket.on('call_rejected', (data) => {
+      io.to(data.toUserId).emit('call_rejected', {});
+  });
+
+  socket.on('call_ended', (data) => {
+      // Optional: notify the other peer if connected
+      // In a real WebRTC setup, this would close connections
+  });
+
   socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
-    }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+    console.log('User disconnected', socket.id);
+    users = users.filter(u => u.id !== socket.id);
+    io.emit('users_list', users);
   });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
-});
-
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
-});
-
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
-});
-
-// Start server
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`SERVER RUNNING ON PORT ${PORT}`);
 });
-
-module.exports = { app, server, io }; 
